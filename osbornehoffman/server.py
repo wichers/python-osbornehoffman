@@ -217,7 +217,7 @@ class OHConnection:
             timestamp = int(event["timestamp"], 16)
             event["timestamp"] = datetime.fromtimestamp(timestamp).isoformat()
 
-        # If there is a code, map it to the SIA Code spec.
+        # If there is an event, map it to the SIA Code spec.
         if event.get("sia_event") is not None and (
             sub_map := SIA_EVENTS.get(event["sia_event"])
         ):
