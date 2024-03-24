@@ -1,6 +1,10 @@
 Release History
 ===============
 
+1.0.3 (24-March-2024)
+
+fixed issue where panel_id was not sent
+
 1.0.2 (24-March-2024)
 -------------------
 

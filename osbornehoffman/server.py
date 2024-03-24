@@ -124,17 +124,17 @@ class OHConnection:
                 _LOGGER.debug("Sending new ID (%d) to panel", account.panel_id)
                 response = b"ID" + str(account.panel_id).zfill(8).encode()
                 response = self.encrypt_data(response)
-                continue
-
-            if self._server.callback is not None:
-                ack = await self._server.callback(event)
             else:
-                ack = True
+                if self._server.callback is not None:
+                    ack = await self._server.callback(event)
+                else:
+                    ack = True
 
-            _LOGGER.debug(
-                "Acknowledge: %s, Encrypted: %s", ack, event.get("encrypted_ack")
-            )
-            response = self.get_ack_response(ack, event.get("encrypted_ack"))
+                _LOGGER.debug(
+                    "Acknowledge: %s, Encrypted: %s", ack, event.get("encrypted_ack")
+                )
+                response = self.get_ack_response(ack, event.get("encrypted_ack"))
+
             writer.write(response)
             await writer.drain()
 
