@@ -25,8 +25,7 @@ pip3 install osbornehoffman
 import asyncio
 import logging
 
-from server import OsborneHoffmanTcpServer
-from account import OsborneHoffmanAccount
+from osbornehoffman import OHServer, OHAccount
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -36,18 +35,15 @@ async def main():
     async def process_event_cb(event: dict) -> bool:
         """Process callback from server."""
         print("Processing event")
-        
-        # return True for sending an ACK back to the panel
         return True
 
     HOST, PORT = "0.0.0.0", 12000
 
-    accounts = {'001234': OsborneHoffmanAccount('001234', 100)}
-    ctx = OsborneHoffmanTcpServer(HOST, PORT, accounts, process_event_cb)
+    accounts = {"001234": OHAccount("001234", 100)}
+    ctx = OHServer(HOST, PORT, accounts, process_event_cb)
     await ctx.start_server()
     async with ctx.server:
         await ctx.server.serve_forever()
-
 
 asyncio.run(main())
 ```

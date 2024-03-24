@@ -16,7 +16,7 @@ class InvalidAccountLengthError(Exception):
 
 
 @dataclass
-class OsborneHoffmanAccount:
+class OHAccount:
     """Class for Osborne Hoffman Accounts."""
 
     account_id: str
@@ -53,6 +53,6 @@ class OsborneHoffmanAccount:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, acc: dict[str, Any]) -> OsborneHoffmanAccount:
+    def from_dict(cls, acc: dict[str, Any]) -> OHAccount:
         """Create a OH Account from a dict."""
         return cls(**acc)
