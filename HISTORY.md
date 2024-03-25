@@ -1,9 +1,10 @@
 Release History
 ===============
 
-1.0.3 (24-March-2024)
+1.0.3 (25-March-2024)
 
 fixed issue where panel_id was not sent
+panel id should only be changed in response to a heartbeat
 
 1.0.2 (24-March-2024)
 -------------------

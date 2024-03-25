@@ -116,7 +116,11 @@ class OHConnection:
                 continue
 
             # New panel ID requested?
-            if event.get("panel_id") == 0:
+            if (
+                event.get("message_type")
+                in (MessageType.HB_NEW_STYLE, MessageType.HB_OLD_STYLE)
+                and event.get("panel_id") == 0
+            ):
                 # the panel ID is used to check for Panel Substition which
                 # should trigger an AA Alarm on the server:
                 # AA Alarm - Panel Substitution An attempt to substitute an
@@ -209,9 +213,11 @@ class OHConnection:
             data.count("\x00", msglen - 1) > 0
         )
 
-        if "panel_id" in event and len(event["panel_id"]) == 16:
-            panel_id = base64.b16decode(event["panel_id"])
-            event["panel_id"] = int(self.decrypt_data(panel_id).decode())
+        if panel_id := event.get("panel_id"):
+            if len(panel_id) == 16:
+                panel_id = base64.b16decode(panel_id)
+                panel_id = self.decrypt_data(panel_id).decode()
+            event["panel_id"] = int(panel_id)
 
         if event.get("timestamp") is not None:
             timestamp = int(event["timestamp"], 16)

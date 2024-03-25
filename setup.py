@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="osbornehoffman",
-    version="1.0.2",
+    version="1.0.3",
     author="wichers",
     author_email="wichers@users.noreply.github.com",
     description="Python 3 package to interface with Osborne Hoffman panels.",
