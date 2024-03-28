@@ -21,7 +21,10 @@ __license__ = "mit"
 
 from .account import OHAccount
 from .server import OHServer
+from .server import MessageType
 from .account import (
     InvalidAccountFormatError,
     InvalidAccountLengthError,
+    InvalidPanelIDFormatError,
+    InvalidPanelIDLengthError,
 )

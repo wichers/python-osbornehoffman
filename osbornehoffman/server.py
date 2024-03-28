@@ -8,6 +8,7 @@ from enum import Enum
 
 from Crypto.Cipher import DES3
 from Crypto.Random import get_random_bytes
+from crc import Calculator, Crc16
 
 from .account import OHAccount
 from .tables import CID_SIA_MAPPING, SIA_EVENTS
@@ -38,36 +39,45 @@ cid_parse_regex = r"""\n01010[0-9a-fA-F]{3}.ADM-CID.
 (?P<line>[0-9a-fA-F]{4,5})\[\#
 (?P<account>[0-9a-fA-F]{6})\|
 (?P<qualifier>[0-9a-fA-F]{1})
-(?P<event_code>[0-9a-fA-F]{3})[ ]
-(?P<area>[0-9a-fA-F]{2})[ ]
+(?P<event_code>[0-9a-fA-F]{3})[\s]
+(?P<area>[0-9a-fA-F]{2})[\s]
 (?P<zone>[0-9a-fA-F]{3})\]
 ((?P<panel_id>[0-9a-fA-F]{16})\|\#
 (?P<system_account>[0-9a-fA-F]{6}))?(?:T)?
 (?P<timestamp>[0-9a-fA-F]{8})?\r.*"""
 CID_MATCHER = re.compile(cid_parse_regex, re.X)
 
-# heartbeat new sty;e
-hb_new_style_parse_regex = r"""SR
+# V2 and higher heartbeat
+hb_v2_parse_regex = r"""SR
 (?P<receiver>[0-9a-fA-F]{4})L
-(?P<line>[0-9a-fA-F]{4,5})[ ]{4}
-(?P<system_account>[0-9a-fA-F]{6})XX[ ]{4}\x00\[ID
+(?P<line>[0-9a-fA-F]{4,5})[\s]{4}
+(?P<system_account>[0-9a-fA-F]{6})XX[\s]{4}\x00\[ID
 (?P<panel_id>[0-9a-fA-F]{8})\]\s?(?:T)?
 (?P<timestamp>[0-9a-fA-F]{8})?[\S\s]*"""
-HB_NEW_STYLE_MATCHER = re.compile(hb_new_style_parse_regex, re.X)
+HB_V2_MATCHER = re.compile(hb_v2_parse_regex, re.X)
 
-# older style heartbeat
-hb_old_style_parse_regex = r"""SR
+# <= 1.93 heartbeat
+hb_v1_parse_regex = r"""SR
 (?P<receiver>[0-9a-fA-F]{4})L
-(?P<line>[0-9a-fA-F]{4,5})[ ]{4}
-(?P<system_account>[0-9a-fA-F]{6})XX[ ]{4}[\S\s]*"""
-HB_OLD_STYLE_MATCHER = re.compile(hb_old_style_parse_regex, re.X)
+(?P<line>[0-9a-fA-F]{4,5})[\s]{4}
+(?P<system_account>[0-9a-fA-F]{6})XX[\s]{4}[\S\s]*"""
+HB_V1_MATCHER = re.compile(hb_v1_parse_regex, re.X)
+
+v4_header_parse_regex = r"""\#40R
+(?P<receiver>[0-9a-fA-F]{4})L
+(?P<line>[0-9a-fA-F]{4,5})A
+(?P<system_account>[0-9a-fA-F]{6})S
+(?P<payload_length>[0-9a-fA-F]{4})
+(?P<panel_iv>[\S\s]{16})[\S\s]*C
+(?P<crc>[0-9a-fA-F]{4})"""
+V4_HEADER_MATCHER = re.compile(v4_header_parse_regex, re.X)
 
 
 class MessageType(Enum):
     SIA = 1
     CID = 2
-    HB_NEW_STYLE = 3
-    HB_OLD_STYLE = 4
+    HB_V1 = 3
+    HB_V2 = 4
 
 
 class OHConnection:
@@ -117,9 +127,8 @@ class OHConnection:
 
             # New panel ID requested?
             if (
-                event.get("message_type")
-                in (MessageType.HB_NEW_STYLE, MessageType.HB_OLD_STYLE)
-                and event.get("panel_id") == 0
+                event.get("message_type") in (MessageType.HB_V2, MessageType.HB_V1)
+                and event.get("panel_id") != account.panel_id
             ):
                 # the panel ID is used to check for Panel Substition which
                 # should trigger an AA Alarm on the server:
@@ -129,7 +138,13 @@ class OHConnection:
                 response = b"ID" + str(account.panel_id).zfill(8).encode()
                 response = self.encrypt_data(response)
             else:
-                if self._server.callback is not None:
+
+                if (
+                    event.get("message_type") in (MessageType.HB_V2, MessageType.HB_V1)
+                    and account.forward_hearbeat is False
+                ):
+                    ack = True
+                elif self._server.callback is not None:
                     ack = await self._server.callback(event)
                 else:
                     ack = True
@@ -192,17 +207,26 @@ class OHConnection:
 
             msglen = data.find("]") + 1
 
-        elif hb_match := HB_NEW_STYLE_MATCHER.match(data):
+        elif hb_match := HB_V2_MATCHER.match(data):
             event |= hb_match.groupdict()
-            event["message_type"] = MessageType.HB_NEW_STYLE
+            event["message_type"] = MessageType.HB_V2
 
             msglen = data.find("XX") + 2
 
-        elif hb_match := HB_OLD_STYLE_MATCHER.match(data):
+        elif hb_match := HB_V1_MATCHER.match(data):
             event |= hb_match.groupdict()
-            event["message_type"] = MessageType.HB_OLD_STYLE
+            event["message_type"] = MessageType.HB_V1
 
             msglen = data.find("XX") + 2
+
+        elif v4_match := V4_HEADER_MATCHER.match(data):
+            event |= v4_match.groupdict()
+            event["payload_length"] = int(event["payload_length"], 16)
+            event["crc"] = int(event["crc"], 16)
+            calc = Calculator(Crc16.MODBUS)
+            crc = calc.checksum(data[: event["payload_length"] + 41])
+            if event["crc"] != crc:
+                raise NotImplementedError("v4 crc mismatch on payload")
 
         else:
             raise NotImplementedError(
@@ -217,7 +241,7 @@ class OHConnection:
             if len(panel_id) == 16:
                 panel_id = base64.b16decode(panel_id)
                 panel_id = self.decrypt_data(panel_id).decode()
-            event["panel_id"] = int(panel_id)
+            event["panel_id"] = int(panel_id, 16)
 
         if event.get("timestamp") is not None:
             timestamp = int(event["timestamp"], 16)
