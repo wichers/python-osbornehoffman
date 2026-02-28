@@ -1,16 +1,9 @@
-import sys
-
-if sys.version_info[:2] >= (3, 8):
-    # TODO: Import directly (no need for conditional) when `python_requires = >= 3.8`
-    from importlib.metadata import PackageNotFoundError, version  # pragma: no cover
-else:
-    from importlib_metadata import PackageNotFoundError, version  # pragma: no cover
+from importlib.metadata import PackageNotFoundError, version
 
 try:
-    # Change here if project is renamed and does not equal the package name
     dist_name = __name__
     __version__ = version(dist_name)
-except PackageNotFoundError:  # pragma: no cover
+except PackageNotFoundError:
     __version__ = "unknown"
 finally:
     del version, PackageNotFoundError
@@ -19,12 +12,14 @@ __author__ = "Alexander Wichers"
 __copyright__ = "Alexander Wichers"
 __license__ = "mit"
 
-from .account import OHAccount
-from .server import OHServer
-from .server import MessageType
 from .account import (
     InvalidAccountFormatError,
     InvalidAccountLengthError,
     InvalidPanelIDFormatError,
     InvalidPanelIDLengthError,
+    OHAccount,
 )
+from .client import OHClient
+from .event import OHEvent
+from .keystore import OHKeyStore
+from .server import MessageType, OHServer

@@ -28,13 +28,11 @@ class OHAccount:
     """Class for Osborne Hoffman Accounts."""
 
     account_id: str
-    panel_id: int
-    forward_hearbeat: bool
+    panel_id: int = 0
+    forward_heartbeat: bool = True
 
     def __post_init__(self) -> None:
         self.account_id = self.account_id.upper()
-        self.panel_id = self.panel_id.upper()
-        self.forward_hearbeat = False
 
     @classmethod
     def validate_account(

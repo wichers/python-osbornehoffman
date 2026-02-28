@@ -1,3 +1,10 @@
+"""Osborne Hoffman protocol server implementation.
+
+Supports V1-V3 (3DES/ECB) and V4 (AES/CBC with Diffie-Hellman key exchange).
+"""
+
+from __future__ import annotations
+
 import asyncio
 import base64
 import logging
@@ -6,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from enum import Enum
 
-from Crypto.Cipher import DES3
+from Crypto.Cipher import AES, DES3
 from Crypto.Random import get_random_bytes
 from crc import Calculator, Crc16
 
@@ -14,6 +21,13 @@ from .account import OHAccount
 from .tables import CID_SIA_MAPPING, SIA_EVENTS
 
 _LOGGER = logging.getLogger(__name__)
+
+# XOR mask for key scrambling (OH protocol spec)
+_KEY_XOR_MASK = bytes([
+    0x55, 0x2D, 0x6A, 0x05, 0x23, 0x49, 0x39, 0xA8,
+    0x45, 0x29, 0xD3, 0xE9, 0x94, 0xC2, 0xB5, 0x88,
+    0x45, 0xA3, 0x50, 0x8A, 0x44, 0xAA, 0x69, 0x54,
+])
 
 # Security Industry Association event parsing
 sia_parse_regex = r"""\n01010[0-9a-fA-F]{3}.SIA-DCS.
@@ -25,7 +39,7 @@ sia_parse_regex = r"""\n01010[0-9a-fA-F]{3}.SIA-DCS.
 (?P<area>[0-9a-fA-F]{1,4})?\/?
 (?P<event_code>(
     (?P<sia_event>[a-zA-Z]{2})
-    (?P<sia_code>[0-9a-fA-F]{0,4})?\/?)+)
+    (?P<sia_zone>[0-9a-fA-F]{0,4})?\/?)+)
 (\*\'(?P<text>.*)\'NM)?\]
 (?P<panel_id>[0-9a-fA-F]{16})?(\|\#)?
 (?P<system_account>[0-9a-fA-F]{6})?(?:T)?
@@ -63,14 +77,19 @@ hb_v1_parse_regex = r"""SR
 (?P<system_account>[0-9a-fA-F]{6})XX[\s]{4}[\S\s]*"""
 HB_V1_MATCHER = re.compile(hb_v1_parse_regex, re.X)
 
+# V4 protocol header (checked on raw bytes BEFORE 3DES decryption)
 v4_header_parse_regex = r"""\#40R
 (?P<receiver>[0-9a-fA-F]{4})L
 (?P<line>[0-9a-fA-F]{4,5})A
 (?P<system_account>[0-9a-fA-F]{6})S
-(?P<payload_length>[0-9a-fA-F]{4})
-(?P<panel_iv>[\S\s]{16})[\S\s]*C
-(?P<crc>[0-9a-fA-F]{4})"""
+(?P<payload_length>[0-9a-fA-F]{4})"""
 V4_HEADER_MATCHER = re.compile(v4_header_parse_regex, re.X)
+
+# V4 header constants
+V4_HEADER_LEN = 25       # Header without IV
+V4_HEADER_IV_LEN = 41    # Header + 16-byte IV
+V4_IV_LEN = 16           # IV length
+V4_CRC_FIELD_LEN = 5     # "C" + 4 hex chars
 
 
 class MessageType(Enum):
@@ -78,107 +97,287 @@ class MessageType(Enum):
     CID = 2
     HB_V1 = 3
     HB_V2 = 4
+    DHR = 5
+    V4 = 6
 
 
 class OHConnection:
 
-    def __init__(self, server):
-        """Initialize the instance."""
+    def __init__(self, server: "OHServer") -> None:
+        """Initialize the instance with per-connection 3DES key."""
         self._server = server
         self._key = DES3.adjust_key_parity(get_random_bytes(24))
         self._cipher = DES3.new(self._key, mode=DES3.MODE_ECB)
+        self._scrambled_key = self._scramble_key(self._key)
+        # Server IV for V4: first 16 bytes of the scrambled key
+        self._server_iv = bytes(self._scrambled_key[:V4_IV_LEN])
+        # Per-connection AES key (set after DH negotiation or from keystore)
+        self._aes_key: bytes | None = None
 
     async def __call__(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Process callback from the TCP server if a new connection has been
-        opened."""
+        """Process callback from the TCP server when a new connection is opened."""
         peername = writer.get_extra_info("peername")
+        _LOGGER.debug("New connection from %s", peername)
 
-        _LOGGER.debug("Sending key handshake to panel")
-        writer.write(self.get_scrambled_key())
-        await writer.drain()
-
-        while not reader.at_eof():
-            try:
-                data = await reader.read(1024)
-                if data is None:
-                    break
-            except asyncio.IncompleteReadError:
-                continue
-            except ConnectionResetError:
-                break
-
-            try:
-                event = await self.parse_event(peername, data)
-            except ValueError as exc:
-                _LOGGER.warning("Formatting error: %s, %s", exc, data)
-                continue
-            except NotImplementedError as exc:
-                _LOGGER.warning("%s: %s", exc, data)
-                continue
-
-            if self._server.accounts:
-                account = self._server.accounts.get(event.get("system_account"))
-
-            if account is None:
-                _LOGGER.warning("Received event for non existing account: %s", event)
-                continue
-
-            # New panel ID requested?
-            if (
-                event.get("message_type") in (MessageType.HB_V2, MessageType.HB_V1)
-                and event.get("panel_id") != account.panel_id
-            ):
-                # the panel ID is used to check for Panel Substition which
-                # should trigger an AA Alarm on the server:
-                # AA Alarm - Panel Substitution An attempt to substitute an
-                # alternate alarm panel for a secure panel has been made
-                _LOGGER.debug("Sending new ID (%d) to panel", account.panel_id)
-                response = b"ID" + str(account.panel_id).zfill(8).encode()
-                response = self.encrypt_data(response)
-            else:
-
-                if (
-                    event.get("message_type") in (MessageType.HB_V2, MessageType.HB_V1)
-                    and account.forward_hearbeat is False
-                ):
-                    ack = True
-                elif self._server.callback is not None:
-                    ack = await self._server.callback(event)
-                else:
-                    ack = True
-
-                _LOGGER.debug(
-                    "Acknowledge: %s, Encrypted: %s", ack, event.get("encrypted_ack")
-                )
-                response = self.get_ack_response(ack, event.get("encrypted_ack"))
-
-            writer.write(response)
+        try:
+            _LOGGER.debug("Sending key handshake to panel")
+            writer.write(self._scrambled_key)
             await writer.drain()
 
-    def get_ack_response(self, ack, encrypted):
-        if encrypted:
-            if ack:
-                response = b"ACK\r"
-            else:
-                response = b"NACK\r"
-            response = self.encrypt_data(response)
-        else:
-            if ack:
-                response = b"ACK\r\n"
-            else:
-                response = b"NACK\r\n"
-        return response
+            while not reader.at_eof():
+                try:
+                    data = await asyncio.wait_for(
+                        reader.read(1024), timeout=300
+                    )
+                    if not data:
+                        break
+                except asyncio.TimeoutError:
+                    _LOGGER.debug("Connection timeout for %s", peername)
+                    break
+                except asyncio.IncompleteReadError:
+                    continue
+                except ConnectionResetError:
+                    break
 
-    async def parse_event(self, peername: tuple, data: bytes) -> dict:
+                # Check for V4 header BEFORE 3DES decryption
+                # V4 messages have a plaintext header, not 3DES encrypted
+                is_v4, event = await self._process_message(
+                    peername, data, reader, writer
+                )
+                if event is None:
+                    continue
+
+                account = None
+                if self._server.accounts:
+                    account = self._server.accounts.get(
+                        event.get("system_account")
+                    )
+
+                if account is None:
+                    _LOGGER.warning(
+                        "Received event for non existing account: %s", event
+                    )
+                    continue
+
+                # Handle DHR — Diffie-Hellman request (V4 setup)
+                if event.get("message_type") == MessageType.DHR:
+                    await self._handle_dhr(
+                        event, account, reader, writer
+                    )
+                    continue
+
+                # New panel ID requested?
+                if (
+                    event.get("message_type")
+                    in (MessageType.HB_V2, MessageType.HB_V1)
+                    and event.get("panel_id") != account.panel_id
+                ):
+                    _LOGGER.debug(
+                        "Sending new ID (%08X) to panel", account.panel_id
+                    )
+                    response = b"ID" + f"{account.panel_id:08X}".encode()
+                    if is_v4:
+                        response = self._encrypt_aes(response)
+                    else:
+                        response = self._encrypt_des3(response)
+                else:
+                    if (
+                        event.get("message_type")
+                        in (MessageType.HB_V2, MessageType.HB_V1)
+                        and account.forward_heartbeat is False
+                    ):
+                        ack = True
+                    elif self._server.callback is not None:
+                        ack = await self._server.callback(event)
+                    else:
+                        ack = True
+
+                    _LOGGER.debug(
+                        "Acknowledge: %s, Encrypted: %s, V4: %s",
+                        ack,
+                        event.get("encrypted_ack"),
+                        is_v4,
+                    )
+                    response = self._get_ack_response(
+                        ack, event.get("encrypted_ack"), is_v4
+                    )
+
+                writer.write(response)
+                await writer.drain()
+        finally:
+            _LOGGER.debug("Closing connection from %s", peername)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _process_message(
+        self,
+        peername: tuple,
+        data: bytes,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> tuple[bool, dict | None]:
+        """Process an incoming message, detecting V4 vs V3 format.
+
+        Returns (is_v4, event_dict) or (False, None) on error.
+        """
+        # Try to detect V4 header on raw (un-decrypted) data
+        try:
+            raw_str = data[:V4_HEADER_LEN].decode("ascii", errors="ignore")
+        except Exception:
+            raw_str = ""
+
+        if raw_str.startswith("#40"):
+            return await self._process_v4_message(peername, data)
+
+        # V3 and below: decrypt with 3DES first
+        try:
+            event = self._parse_v3_event(peername, data)
+        except ValueError as exc:
+            _LOGGER.warning("Formatting error: %s, %s", exc, data)
+            return False, None
+        except NotImplementedError as exc:
+            _LOGGER.warning("%s: %s", exc, data)
+            return False, None
+
+        return False, event
+
+    async def _process_v4_message(
+        self, peername: tuple, data: bytes
+    ) -> tuple[bool, dict | None]:
+        """Process a V4 protocol message (AES/CBC encrypted payload)."""
+        try:
+            data_str = data.decode("ascii", errors="ignore")
+        except Exception:
+            _LOGGER.warning("V4: Failed to decode header")
+            return True, None
+
+        v4_match = V4_HEADER_MATCHER.match(data_str)
+        if not v4_match:
+            _LOGGER.warning("V4: Header pattern match failed")
+            return True, None
+
+        header_fields = v4_match.groupdict()
+        payload_length = int(header_fields["payload_length"], 16)
+        system_account = header_fields["system_account"]
+
+        # Extract panel IV (16 bytes after the 25-byte header)
+        if len(data) < V4_HEADER_IV_LEN + payload_length + V4_CRC_FIELD_LEN:
+            _LOGGER.warning("V4: Message too short")
+            return True, None
+
+        panel_iv = data[V4_HEADER_LEN:V4_HEADER_IV_LEN]
+
+        # CRC validation over header + payload
+        crc_offset = V4_HEADER_IV_LEN + payload_length
+        crc_str = data_str[crc_offset + 1 : crc_offset + V4_CRC_FIELD_LEN]
+        try:
+            msg_crc = int(crc_str, 16)
+        except ValueError:
+            _LOGGER.warning("V4: Invalid CRC field: %s", crc_str)
+            return True, None
+
+        calc = Calculator(Crc16.MODBUS)
+        calc_crc = calc.checksum(data[: payload_length + V4_HEADER_IV_LEN])
+        if msg_crc != calc_crc:
+            _LOGGER.warning(
+                "V4: CRC mismatch (got %04X, expected %04X)", msg_crc, calc_crc
+            )
+            return True, None
+
+        # Get AES key for this account
+        aes_key = self._get_aes_key(system_account)
+        if aes_key is None:
+            _LOGGER.warning(
+                "V4: No AES key for account %s", system_account
+            )
+            return True, None
+
+        # Mix IVs: even indices from server, odd indices from panel
+        mixed_iv = self._mix_iv(panel_iv)
+
+        # Decrypt payload with AES/CBC
+        encrypted_payload = data[
+            V4_HEADER_IV_LEN : V4_HEADER_IV_LEN + payload_length
+        ]
+        # Ensure payload is multiple of AES block size
+        if len(encrypted_payload) % 16 != 0:
+            _LOGGER.warning("V4: Payload not aligned to AES block size")
+            return True, None
+
+        try:
+            cipher = AES.new(aes_key, AES.MODE_CBC, mixed_iv)
+            decrypted = cipher.decrypt(encrypted_payload)
+        except Exception as exc:
+            _LOGGER.warning("V4: AES decryption failed: %s", exc)
+            return True, None
+
+        _LOGGER.debug("V4 decrypted payload: %s", decrypted)
+
+        # Parse decrypted payload as a V3-style message
+        try:
+            decrypted_str = decrypted.decode("ascii", errors="ignore")
+        except Exception:
+            _LOGGER.warning("V4: Failed to decode decrypted payload")
+            return True, None
+
+        # Parse the decrypted inner message
+        event = {"peername": peername, "is_v4": True}
+        event = self._parse_message_content(event, decrypted_str)
+
+        if event is None:
+            _LOGGER.warning("V4: Failed to parse decrypted payload")
+            return True, None
+
+        # Ensure system_account from header
+        if event.get("system_account") is None:
+            event["system_account"] = system_account
+
+        # Store V4 metadata
+        event["panel_iv"] = panel_iv
+
+        _LOGGER.debug("V4 Event: %s", event)
+        return True, event
+
+    def _parse_v3_event(self, peername: tuple, data: bytes) -> dict:
+        """Parse a V3 (3DES-encrypted) message."""
+        decrypted = self._decrypt_des3(data)
+        _LOGGER.debug("Decrypted data: %s", decrypted)
+
+        decoded = decrypted.decode("ascii", errors="ignore")
+
+        # Check for DHR (Diffie-Hellman Request)
+        if decoded.strip("\x00").startswith("DHR"):
+            return {
+                "peername": peername,
+                "message_type": MessageType.DHR,
+                "system_account": None,
+                "encrypted_ack": False,
+            }
+
         event = {"peername": peername}
+        event = self._parse_message_content(event, decoded)
 
-        data = self.decrypt_data(data)
-        _LOGGER.debug("Decrypted data: %s", data)
+        if event is None:
+            raise NotImplementedError(
+                "No matches found, event was not an OH Spec event"
+            )
 
-        # we regex on string not on bytearray
-        data = data.decode("ascii")
+        _LOGGER.debug("Event: %s", event)
+        return event
+
+    def _parse_message_content(
+        self, event: dict, data: str
+    ) -> dict | None:
+        """Parse decoded message content against SIA/CID/HB patterns.
+
+        Returns the enriched event dict, or None if no pattern matched.
+        """
+        msglen = 0
 
         if sia_match := SIA_MATCHER.match(data):
             event |= sia_match.groupdict()
@@ -196,7 +395,7 @@ class OHConnection:
             if event.get("system_account") is None:
                 event["system_account"] = event.get("account")
 
-            # If it is a ADM-CID message, map the qualifier and type to a code.
+            # Map CID qualifier+type to SIA code
             if (
                 event.get("qualifier") is not None
                 and event.get("event_code") is not None
@@ -210,44 +409,44 @@ class OHConnection:
         elif hb_match := HB_V2_MATCHER.match(data):
             event |= hb_match.groupdict()
             event["message_type"] = MessageType.HB_V2
-
             msglen = data.find("XX") + 2
 
         elif hb_match := HB_V1_MATCHER.match(data):
             event |= hb_match.groupdict()
             event["message_type"] = MessageType.HB_V1
-
             msglen = data.find("XX") + 2
 
-        elif v4_match := V4_HEADER_MATCHER.match(data):
-            event |= v4_match.groupdict()
-            event["payload_length"] = int(event["payload_length"], 16)
-            event["crc"] = int(event["crc"], 16)
-            calc = Calculator(Crc16.MODBUS)
-            crc = calc.checksum(data[: event["payload_length"] + 41])
-            if event["crc"] != crc:
-                raise NotImplementedError("v4 crc mismatch on payload")
-
         else:
-            raise NotImplementedError(
-                "No matches found, event was not an OH Spec event"
-            )
+            return None
 
+        # Determine if ACK should be encrypted
         event["encrypted_ack"] = (len(data) % 8 == 0) and (
             data.count("\x00", msglen - 1) > 0
         )
 
+        # Decrypt panel ID if encrypted (16-char hex = encrypted, 8-char = plain)
         if panel_id := event.get("panel_id"):
             if len(panel_id) == 16:
                 panel_id = base64.b16decode(panel_id)
-                panel_id = self.decrypt_data(panel_id).decode()
+                panel_id = self._decrypt_des3(panel_id).decode(
+                    "ascii", errors="ignore"
+                )
             event["panel_id"] = int(panel_id, 16)
 
+        # Convert timestamp from hex epoch to ISO format
         if event.get("timestamp") is not None:
-            timestamp = int(event["timestamp"], 16)
-            event["timestamp"] = datetime.fromtimestamp(timestamp).isoformat()
+            try:
+                timestamp = int(event["timestamp"], 16)
+                event["timestamp"] = datetime.fromtimestamp(
+                    timestamp
+                ).isoformat()
+            except (ValueError, OSError):
+                _LOGGER.warning(
+                    "Invalid timestamp: %s", event["timestamp"]
+                )
+                event["timestamp"] = None
 
-        # If there is an event, map it to the SIA Code spec.
+        # Map SIA event code to full spec description
         if event.get("sia_event") is not None and (
             sub_map := SIA_EVENTS.get(event["sia_event"])
         ):
@@ -255,61 +454,121 @@ class OHConnection:
             event["sia_description"] = sub_map.get("description")
             event["sia_concerns"] = sub_map.get("concerns")
 
-        _LOGGER.debug("Event: %s", event)
-
         return event
 
-    def encrypt_data(
+    async def _handle_dhr(
         self,
-        data: bytes,
-    ):
+        event: dict,
+        account: OHAccount,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle a Diffie-Hellman key exchange request from the panel."""
+        from .dh import negotiate_dh
+
+        _LOGGER.info("DHR: Starting Diffie-Hellman negotiation")
+        aes_key = await negotiate_dh(reader, writer)
+
+        if aes_key is None:
+            _LOGGER.warning("DHR: Key exchange failed")
+            return
+
+        # Store the negotiated AES key
+        self._aes_key = aes_key
+        if self._server.keystore is not None:
+            self._server.keystore.store_aes_key(
+                account.account_id, aes_key
+            )
+        _LOGGER.info("DHR: AES key negotiated for account %s", account.account_id)
+
+    def _get_aes_key(self, system_account: str) -> bytes | None:
+        """Look up the AES key for a system account."""
+        # First check connection-local key
+        if self._aes_key is not None:
+            return self._aes_key
+        # Then check the server keystore
+        if self._server.keystore is not None:
+            return self._server.keystore.get_aes_key(system_account)
+        return None
+
+    def _mix_iv(self, panel_iv: bytes) -> bytes:
+        """Mix server and panel IVs per OH V4 spec.
+
+        Even byte indices come from the server IV,
+        odd byte indices come from the panel IV.
+        """
+        mixed = bytearray(V4_IV_LEN)
+        for i in range(V4_IV_LEN):
+            mixed[i] = self._server_iv[i] if i % 2 == 0 else panel_iv[i]
+        return bytes(mixed)
+
+    def _get_ack_response(
+        self, ack: bool, encrypted: bool, is_v4: bool = False
+    ) -> bytes:
+        """Construct ACK/NACK response with appropriate encryption."""
+        if is_v4:
+            # V4: AES-encrypted 16-byte response
+            response = b"ACK\r" if ack else b"NACK\r"
+            return self._encrypt_aes(response)
+        if encrypted:
+            response = b"ACK\r" if ack else b"NACK\r"
+            return self._encrypt_des3(response)
+        return b"ACK\r\n" if ack else b"NACK\r\n"
+
+    def _encrypt_des3(self, data: bytes) -> bytes:
+        """Encrypt data with 3DES/ECB, padding with null bytes."""
         block_size = 8
         padding_len = block_size - len(data) % block_size
-        padding = bytearray(chr(0) * (padding_len), "ascii")
-        data += padding
-        data = self._cipher.encrypt(data)
-        return data
+        data += b"\x00" * padding_len
+        return self._cipher.encrypt(data)
 
-    def decrypt_data(
-        self,
-        data: bytes,
-    ):
-        data = self._cipher.decrypt(data[: len(data) - len(data) % 8])
-        return data
+    def _decrypt_des3(self, data: bytes) -> bytes:
+        """Decrypt 3DES/ECB data, trimming to block boundary."""
+        aligned = data[: len(data) - len(data) % 8]
+        return self._cipher.decrypt(aligned)
 
-    def get_scrambled_key(self):
-        key = bytearray(self._key)
-        key[0] ^= 0x55
-        key[1] ^= 0x2D
-        key[2] ^= 0x6A
-        key[3] ^= 0x05
-        key[4] ^= 0x23
-        key[5] ^= 0x49
-        key[6] ^= 0x39
-        key[7] ^= 0xA8
-        key[8] ^= 0x45
-        key[9] ^= 0x29
-        key[10] ^= 0xD3
-        key[11] ^= 0xE9
-        key[12] ^= 0x94
-        key[13] ^= 0xC2
-        key[14] ^= 0xB5
-        key[15] ^= 0x88
-        key[16] ^= 0x45
-        key[17] ^= 0xA3
-        key[18] ^= 0x50
-        key[19] ^= 0x8A
-        key[20] ^= 0x44
-        key[21] ^= 0xAA
-        key[22] ^= 0x69
-        key[23] ^= 0x54
-        return key
+    def _encrypt_aes(self, data: bytes) -> bytes:
+        """Encrypt data with AES/CBC using the negotiated key and server IV."""
+        if self._aes_key is None:
+            _LOGGER.warning("AES encrypt called without AES key, falling back to 3DES")
+            return self._encrypt_des3(data)
+        block_size = 16
+        padding_len = block_size - len(data) % block_size
+        data += b"\x00" * padding_len
+        cipher = AES.new(self._aes_key, AES.MODE_CBC, self._server_iv)
+        return cipher.encrypt(data)
+
+    @staticmethod
+    def _scramble_key(key: bytes) -> bytes:
+        """XOR the 3DES key with the OH protocol mask."""
+        scrambled = bytearray(key)
+        for i in range(len(_KEY_XOR_MASK)):
+            scrambled[i] ^= _KEY_XOR_MASK[i]
+        return bytes(scrambled)
+
+    # Legacy compatibility aliases
+    def get_scrambled_key(self) -> bytes:
+        return self._scrambled_key
+
+    def encrypt_data(self, data: bytes) -> bytes:
+        return self._encrypt_des3(data)
+
+    def decrypt_data(self, data: bytes) -> bytes:
+        return self._decrypt_des3(data)
+
+    def get_ack_response(self, ack: bool, encrypted: bool) -> bytes:
+        return self._get_ack_response(ack, encrypted, is_v4=False)
+
+    async def parse_event(self, peername: tuple, data: bytes) -> dict:
+        return self._parse_v3_event(peername, data)
 
 
 class OHServer:
-    """Manages TCP server for Osborne Hoffman compatible <= V3 devices.
+    """Manages TCP server for Osborne Hoffman compatible devices.
 
     Opens a single port and listens for incoming TCP connections.
+    Each connection gets its own encryption key and cipher.
+    Supports V1-V3 (3DES) and V4 (AES/CBC with DH key exchange).
     """
 
     def __init__(
@@ -318,22 +577,36 @@ class OHServer:
         port: int,
         accounts: dict[str, OHAccount],
         callback: Callable[[dict], Awaitable[bool]] | None = None,
+        keystore: "OHKeyStore | None" = None,
     ) -> None:
         """Initialize instance."""
         self.host = host
         self.port = port
         self.accounts = accounts
         self.callback = callback
-        self.server = None
+        self.keystore = keystore
+        self.server: asyncio.Server | None = None
 
-    async def start_server(self):
-        """Start TCP server on configured port."""
+    async def _handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Create a new OHConnection per incoming TCP connection."""
+        conn = OHConnection(self)
+        await conn(reader, writer)
+
+    async def start_server(self, **kwargs) -> None:
+        """Start the Osborne Hoffman TCP server."""
+        _LOGGER.debug(
+            "Starting Osborne Hoffman server on %s:%d.", self.host, self.port
+        )
         self.server = await asyncio.start_server(
-            OHConnection(self), host=self.host, port=self.port
+            self._handle_connection, host=self.host, port=self.port, **kwargs
         )
 
-    async def close_server(self):
-        """Close TCP server."""
+    async def close_server(self) -> None:
+        """Stop the Osborne Hoffman server."""
+        _LOGGER.debug("Stopping Osborne Hoffman server.")
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
+            self.server = None

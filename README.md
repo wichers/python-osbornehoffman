@@ -1,6 +1,6 @@
 # osbornehoffman
 
-Python 3 package to interface with Osborne-Hoffman (OH+CID, OH+SIA or OH+XSIA) compatible panels (up to OH version 3.0):
+Python 3 package to interface with Osborne-Hoffman (OH+CID, OH+SIA or OH+XSIA) compatible panels:
 
   - CSX75 Panel Range (CS7050(N) TCP/IP gateway)
   - CSX75 Panel Range (CS9104/9204 Video Verification Module)
@@ -13,37 +13,65 @@ Python 3 package to interface with Osborne-Hoffman (OH+CID, OH+SIA or OH+XSIA) c
   - NetworX Panel Range (NX-7002(N) GSM/GPRS module)
   - Simon Panel Range (60-938)
 
-The Osborne-Hoffman protocol is a simple TCP overlay protocol that adds Triple DES support, this starts with the server sending a scrambled 192-bit DES key to the client. After the key is sent client communication can start whereby each packet is padded with zero's (not your standard padding scheme) and encrypted with 3DES ECB.
+## Protocol Support
+
+- **V1-V3**: 3DES/ECB encryption with XOR-scrambled key handshake
+- **V4**: AES-256/CBC encryption with Diffie-Hellman key exchange and IV mixing
+
+The Osborne-Hoffman protocol is a TCP overlay protocol where the server sends a scrambled 192-bit 3DES key to the panel. V4 extends this with a Diffie-Hellman negotiation for AES-256 key derivation.
 
 ## Installation
 
-pip3 install osbornehoffman
+```
+pip install osbornehoffman
+```
+
+Requires Python >= 3.10 and `pycryptodome`.
 
 ## Usage
 
+### Using OHClient (recommended)
+
 ```python
 import asyncio
-import logging
-
-from osbornehoffman import OHServer, OHAccount
-
-logging.basicConfig(level=logging.DEBUG)
-
+from osbornehoffman import OHClient, OHAccount, OHEvent
 
 async def main():
+    async def on_event(event: OHEvent) -> None:
+        print(f"Event: code={event.code}, account={event.effective_account}")
 
-    async def process_event_cb(event: dict) -> bool:
-        """Process callback from server."""
-        print("Processing event")
-        return True
-
-    HOST, PORT = "0.0.0.0", 12000
-
-    accounts = {"001234": OHAccount("001234", 100)}
-    ctx = OHServer(HOST, PORT, accounts, process_event_cb)
-    await ctx.start_server()
-    async with ctx.server:
-        await ctx.server.serve_forever()
+    accounts = [OHAccount("001234")]
+    async with OHClient("0.0.0.0", 8996, accounts, on_event) as client:
+        await asyncio.Event().wait()  # run forever
 
 asyncio.run(main())
 ```
+
+### Using OHServer directly
+
+```python
+import asyncio
+from osbornehoffman import OHServer, OHAccount
+
+async def main():
+    async def process_event_cb(event: dict) -> bool:
+        print("Processing event")
+        return True
+
+    accounts = {"001234": OHAccount("001234")}
+    server = OHServer("0.0.0.0", 8996, accounts, process_event_cb)
+    await server.start_server()
+    async with server.server:
+        await server.server.serve_forever()
+
+asyncio.run(main())
+```
+
+## Key Classes
+
+- `OHClient` - High-level async client with lifecycle management (start/stop, context manager)
+- `OHServer` - Low-level TCP server handling protocol framing and encryption
+- `OHAccount` - Account configuration (account_id, panel_id, forward_heartbeat)
+- `OHEvent` - Parsed event dataclass with `code`, `ri`, `effective_account` properties
+- `OHKeyStore` - JSON-based persistence for V4 AES keys
+- `MessageType` - Enum for event types (SIA, CID, HB_V1, HB_V2, DHR, V4)
