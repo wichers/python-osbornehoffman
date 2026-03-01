@@ -1,6 +1,11 @@
 Release History
 ===============
 
+2.1.1 (01-March-2026)
+-------------------
+
+- aligned CID and heartbeat regex patterns to match Java MsgPatternBuilder exactly
+
 2.1.0 (01-March-2026)
 -------------------
 
@@ -12,7 +17,6 @@ Bug fixes and robustness improvements:
 - fixed panel ID assignment restricted to V2+ heartbeats only (V1 has no panel_id field)
 - fixed panel ID decryption error handling (graceful fallback instead of crash)
 - fixed DHR handling to use last known account (DHR messages have no system_account)
-- aligned CID and heartbeat regex patterns to match Java MsgPatternBuilder exactly
 - added V4 NACK response for unprocessable V4 messages (matches Java NetRec behavior)
 - added robust account resolution with session state and single-account fallback
 - added per-connection mixed IV storage for V4 response encryption
