@@ -1,6 +1,23 @@
 Release History
 ===============
 
+2.1.0 (01-March-2026)
+-------------------
+
+Bug fixes and robustness improvements:
+
+- fixed V4 CRC extraction using raw bytes instead of ASCII-decoded string (binary IV/payload bytes were dropped by errors="ignore", shifting CRC field offset)
+- fixed V4 AES encryption using mixed IV (even bytes from server, odd from panel) matching Java MsgWorker behavior
+- fixed V4 system_account always using authoritative V4 header value instead of inner payload fallback
+- fixed panel ID assignment restricted to V2+ heartbeats only (V1 has no panel_id field)
+- fixed panel ID decryption error handling (graceful fallback instead of crash)
+- fixed DHR handling to use last known account (DHR messages have no system_account)
+- fixed CID regex to make panel_id and system_account independently optional (matching SIA regex)
+- added V4 NACK response for unprocessable V4 messages (matches Java NetRec behavior)
+- added robust account resolution with session state and single-account fallback
+- added per-connection mixed IV storage for V4 response encryption
+- added dual-mode integration test suite (local OHServer + external Java NetRec)
+
 2.0.0 (28-February-2026)
 -------------------
 

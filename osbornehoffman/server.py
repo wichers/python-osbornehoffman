@@ -56,8 +56,8 @@ cid_parse_regex = r"""\n01010[0-9a-fA-F]{3}.ADM-CID.
 (?P<event_code>[0-9a-fA-F]{3})[\s]
 (?P<area>[0-9a-fA-F]{2})[\s]
 (?P<zone>[0-9a-fA-F]{3})\]
-((?P<panel_id>[0-9a-fA-F]{16})\|\#
-(?P<system_account>[0-9a-fA-F]{6}))?(?:T)?
+(?P<panel_id>[0-9a-fA-F]{16})?(\|\#)?
+(?P<system_account>[0-9a-fA-F]{6})?(?:T)?
 (?P<timestamp>[0-9a-fA-F]{8})?\r.*"""
 CID_MATCHER = re.compile(cid_parse_regex, re.X)
 
@@ -113,6 +113,10 @@ class OHConnection:
         self._server_iv = bytes(self._scrambled_key[:V4_IV_LEN])
         # Per-connection AES key (set after DH negotiation or from keystore)
         self._aes_key: bytes | None = None
+        # Last mixed IV for V4 AES encryption (updated per V4 message)
+        self._mixed_iv: bytes | None = None
+        # Last known account for this connection (needed for DHR which has no account field)
+        self._last_account: OHAccount | None = None
 
     async def __call__(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -147,13 +151,26 @@ class OHConnection:
                     peername, data, reader, writer
                 )
                 if event is None:
+                    if is_v4:
+                        # V4 message couldn't be processed; send 3DES NACK
+                        writer.write(self._encrypt_des3(b"NACK\r"))
+                        await writer.drain()
                     continue
 
-                account = None
-                if self._server.accounts:
-                    account = self._server.accounts.get(
-                        event.get("system_account")
+                # Handle DHR — Diffie-Hellman request (V4 setup)
+                # DHR has no system_account; use last known account
+                if event.get("message_type") == MessageType.DHR:
+                    if self._last_account is None:
+                        _LOGGER.warning(
+                            "DHR received before any account identified"
+                        )
+                        continue
+                    await self._handle_dhr(
+                        event, self._last_account, reader, writer
                     )
+                    continue
+
+                account = self._resolve_account(event)
 
                 if account is None:
                     _LOGGER.warning(
@@ -161,49 +178,45 @@ class OHConnection:
                     )
                     continue
 
-                # Handle DHR — Diffie-Hellman request (V4 setup)
-                if event.get("message_type") == MessageType.DHR:
-                    await self._handle_dhr(
-                        event, account, reader, writer
-                    )
-                    continue
+                self._last_account = account
 
-                # New panel ID requested?
+                # Panel ID assignment (V2+ only — V1 has no panel_id field)
                 if (
-                    event.get("message_type")
-                    in (MessageType.HB_V2, MessageType.HB_V1)
+                    event.get("message_type") == MessageType.HB_V2
                     and event.get("panel_id") != account.panel_id
                 ):
                     _LOGGER.debug(
                         "Sending new ID (%08X) to panel", account.panel_id
                     )
-                    response = b"ID" + f"{account.panel_id:08X}".encode()
+                    id_response = b"ID" + f"{account.panel_id:08X}".encode()
                     if is_v4:
-                        response = self._encrypt_aes(response)
+                        id_response = self._encrypt_aes(id_response)
                     else:
-                        response = self._encrypt_des3(response)
+                        id_response = self._encrypt_des3(id_response)
+                    writer.write(id_response)
+                    await writer.drain()
+
+                # Invoke callback (unless heartbeat with forward_heartbeat=False)
+                if (
+                    event.get("message_type")
+                    in (MessageType.HB_V2, MessageType.HB_V1)
+                    and account.forward_heartbeat is False
+                ):
+                    ack = True
+                elif self._server.callback is not None:
+                    ack = await self._server.callback(event)
                 else:
-                    if (
-                        event.get("message_type")
-                        in (MessageType.HB_V2, MessageType.HB_V1)
-                        and account.forward_heartbeat is False
-                    ):
-                        ack = True
-                    elif self._server.callback is not None:
-                        ack = await self._server.callback(event)
-                    else:
-                        ack = True
+                    ack = True
 
-                    _LOGGER.debug(
-                        "Acknowledge: %s, Encrypted: %s, V4: %s",
-                        ack,
-                        event.get("encrypted_ack"),
-                        is_v4,
-                    )
-                    response = self._get_ack_response(
-                        ack, event.get("encrypted_ack"), is_v4
-                    )
-
+                _LOGGER.debug(
+                    "Acknowledge: %s, Encrypted: %s, V4: %s",
+                    ack,
+                    event.get("encrypted_ack"),
+                    is_v4,
+                )
+                response = self._get_ack_response(
+                    ack, event.get("encrypted_ack"), is_v4
+                )
                 writer.write(response)
                 await writer.drain()
         finally:
@@ -273,12 +286,15 @@ class OHConnection:
         panel_iv = data[V4_HEADER_LEN:V4_HEADER_IV_LEN]
 
         # CRC validation over header + payload
+        # Extract CRC from raw bytes (not data_str, which drops non-ASCII bytes)
         crc_offset = V4_HEADER_IV_LEN + payload_length
-        crc_str = data_str[crc_offset + 1 : crc_offset + V4_CRC_FIELD_LEN]
+        crc_field = data[crc_offset : crc_offset + V4_CRC_FIELD_LEN]
         try:
-            msg_crc = int(crc_str, 16)
-        except ValueError:
-            _LOGGER.warning("V4: Invalid CRC field: %s", crc_str)
+            if crc_field[0:1] != b"C":
+                raise ValueError(f"Expected 'C' prefix, got {crc_field[0:1]!r}")
+            msg_crc = int(crc_field[1:].decode("ascii"), 16)
+        except (ValueError, UnicodeDecodeError) as exc:
+            _LOGGER.warning("V4: Invalid CRC field: %s (%s)", crc_field, exc)
             return True, None
 
         calc = Calculator(Crc16.MODBUS)
@@ -298,7 +314,9 @@ class OHConnection:
             return True, None
 
         # Mix IVs: even indices from server, odd indices from panel
+        # Store mixed IV for the response encryption (Java uses same mixed IV)
         mixed_iv = self._mix_iv(panel_iv)
+        self._mixed_iv = mixed_iv
 
         # Decrypt payload with AES/CBC
         encrypted_payload = data[
@@ -333,9 +351,8 @@ class OHConnection:
             _LOGGER.warning("V4: Failed to parse decrypted payload")
             return True, None
 
-        # Ensure system_account from header
-        if event.get("system_account") is None:
-            event["system_account"] = system_account
+        # V4: always use system_account from header (authoritative)
+        event["system_account"] = system_account
 
         # Store V4 metadata
         event["panel_iv"] = panel_iv
@@ -382,18 +399,11 @@ class OHConnection:
         if sia_match := SIA_MATCHER.match(data):
             event |= sia_match.groupdict()
             event["message_type"] = MessageType.SIA
-
-            if event.get("system_account") is None:
-                event["system_account"] = event.get("account")
-
             msglen = data.find("]") + 1
 
         elif cid_match := CID_MATCHER.match(data):
             event |= cid_match.groupdict()
             event["message_type"] = MessageType.CID
-
-            if event.get("system_account") is None:
-                event["system_account"] = event.get("account")
 
             # Map CID qualifier+type to SIA code
             if (
@@ -426,12 +436,16 @@ class OHConnection:
 
         # Decrypt panel ID if encrypted (16-char hex = encrypted, 8-char = plain)
         if panel_id := event.get("panel_id"):
-            if len(panel_id) == 16:
-                panel_id = base64.b16decode(panel_id)
-                panel_id = self._decrypt_des3(panel_id).decode(
-                    "ascii", errors="ignore"
-                )
-            event["panel_id"] = int(panel_id, 16)
+            try:
+                if len(panel_id) == 16:
+                    panel_id = base64.b16decode(panel_id)
+                    panel_id = self._decrypt_des3(panel_id).decode(
+                        "ascii", errors="ignore"
+                    ).strip("\x00")
+                event["panel_id"] = int(panel_id, 16)
+            except (ValueError, Exception) as exc:
+                _LOGGER.warning("Failed to parse panel_id '%s': %s", panel_id, exc)
+                event["panel_id"] = None
 
         # Convert timestamp from hex epoch to ISO format
         if event.get("timestamp") is not None:
@@ -455,6 +469,47 @@ class OHConnection:
             event["sia_concerns"] = sub_map.get("concerns")
 
         return event
+
+    def _resolve_account(self, event: dict) -> OHAccount | None:
+        """Resolve event to a registered account.
+
+        Tries in order:
+        1. system_account field (primary key from message suffix or V4 header)
+        2. account field (subscriber account, may match system_account)
+        3. Last known account on this connection (session state)
+        4. Single-account fallback (only one account configured)
+
+        Also sets event["system_account"] to the resolved account_id when
+        resolved via fallback, so downstream code has a consistent value.
+        """
+        accounts = self._server.accounts
+        if not accounts:
+            return None
+
+        # Try system_account (from |#XXXXXX suffix or V4 header)
+        if sa := event.get("system_account"):
+            if acct := accounts.get(sa):
+                return acct
+
+        # Try account field (inside [] brackets — matches when account == system_account)
+        if a := event.get("account"):
+            if acct := accounts.get(a):
+                event["system_account"] = acct.account_id
+                return acct
+
+        # Fall back to last known account on this connection
+        # (panels send heartbeat first, then SIA/CID on same connection)
+        if self._last_account is not None:
+            event["system_account"] = self._last_account.account_id
+            return self._last_account
+
+        # Single-account fallback (common in Home Assistant deployments)
+        if len(accounts) == 1:
+            acct = next(iter(accounts.values()))
+            event["system_account"] = acct.account_id
+            return acct
+
+        return None
 
     async def _handle_dhr(
         self,
@@ -528,14 +583,20 @@ class OHConnection:
         return self._cipher.decrypt(aligned)
 
     def _encrypt_aes(self, data: bytes) -> bytes:
-        """Encrypt data with AES/CBC using the negotiated key and server IV."""
+        """Encrypt data with AES/CBC using the negotiated key and mixed IV.
+
+        Uses the mixed IV from the last V4 message (even bytes from server IV,
+        odd bytes from panel IV), matching the Java MsgWorker behavior.
+        Falls back to server-only IV if no panel IV has been received yet.
+        """
         if self._aes_key is None:
             _LOGGER.warning("AES encrypt called without AES key, falling back to 3DES")
             return self._encrypt_des3(data)
         block_size = 16
         padding_len = block_size - len(data) % block_size
         data += b"\x00" * padding_len
-        cipher = AES.new(self._aes_key, AES.MODE_CBC, self._server_iv)
+        iv = self._mixed_iv if self._mixed_iv is not None else self._server_iv
+        cipher = AES.new(self._aes_key, AES.MODE_CBC, iv)
         return cipher.encrypt(data)
 
     @staticmethod
