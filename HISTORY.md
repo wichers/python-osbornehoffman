@@ -12,7 +12,7 @@ Bug fixes and robustness improvements:
 - fixed panel ID assignment restricted to V2+ heartbeats only (V1 has no panel_id field)
 - fixed panel ID decryption error handling (graceful fallback instead of crash)
 - fixed DHR handling to use last known account (DHR messages have no system_account)
-- fixed CID regex to make panel_id and system_account independently optional (matching SIA regex)
+- aligned CID and heartbeat regex patterns to match Java MsgPatternBuilder exactly
 - added V4 NACK response for unprocessable V4 messages (matches Java NetRec behavior)
 - added robust account resolution with session state and single-account fallback
 - added per-connection mixed IV storage for V4 response encryption
@@ -39,22 +39,22 @@ Breaking changes and new features:
 
 1.0.3 (28-March-2024)
 
-fixed issue where panel_id was not sent
-panel id should only be changed in response to a heartbeat
-added panel id validation
-added option for skipping the forwarding of heartbeats
+- fixed issue where panel_id was not sent
+- panel id should only be changed in response to a heartbeat
+- added panel id validation
+- added option for skipping the forwarding of heartbeats
 
 1.0.2 (24-March-2024)
 -------------------
 
-fixed issue where SIA events were not enriched
+- fixed issue where SIA events were not enriched
 
 1.0.1 (24-March-2024)
 -------------------
 
-added pycryptodome dependency
+- added pycryptodome dependency
 
 1.0.0 (24-March-2024)
 -------------------
 
-Initial revision.
+- Initial revision.

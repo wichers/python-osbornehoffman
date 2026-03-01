@@ -53,19 +53,19 @@ cid_parse_regex = r"""\n01010[0-9a-fA-F]{3}.ADM-CID.
 (?P<line>[0-9a-fA-F]{4,5})\[\#
 (?P<account>[0-9a-fA-F]{6})\|
 (?P<qualifier>[0-9a-fA-F]{1})
-(?P<event_code>[0-9a-fA-F]{3})[\s]
-(?P<area>[0-9a-fA-F]{2})[\s]
+(?P<event_code>[0-9a-fA-F]{3})[ ]
+(?P<area>[0-9a-fA-F]{2})[ ]
 (?P<zone>[0-9a-fA-F]{3})\]
-(?P<panel_id>[0-9a-fA-F]{16})?(\|\#)?
-(?P<system_account>[0-9a-fA-F]{6})?(?:T)?
+((?P<panel_id>[0-9a-fA-F]{16})\|\#
+(?P<system_account>[0-9a-fA-F]{6}))?(?:T)?
 (?P<timestamp>[0-9a-fA-F]{8})?\r.*"""
 CID_MATCHER = re.compile(cid_parse_regex, re.X)
 
 # V2 and higher heartbeat
 hb_v2_parse_regex = r"""SR
 (?P<receiver>[0-9a-fA-F]{4})L
-(?P<line>[0-9a-fA-F]{4,5})[\s]{4}
-(?P<system_account>[0-9a-fA-F]{6})XX[\s]{4}\x00\[ID
+(?P<line>[0-9a-fA-F]{4,5})\ {4}
+(?P<system_account>[0-9a-fA-F]{6})XX\ {4}\x00\[ID
 (?P<panel_id>[0-9a-fA-F]{8})\]\s?(?:T)?
 (?P<timestamp>[0-9a-fA-F]{8})?[\S\s]*"""
 HB_V2_MATCHER = re.compile(hb_v2_parse_regex, re.X)
@@ -73,8 +73,8 @@ HB_V2_MATCHER = re.compile(hb_v2_parse_regex, re.X)
 # <= 1.93 heartbeat
 hb_v1_parse_regex = r"""SR
 (?P<receiver>[0-9a-fA-F]{4})L
-(?P<line>[0-9a-fA-F]{4,5})[\s]{4}
-(?P<system_account>[0-9a-fA-F]{6})XX[\s]{4}[\S\s]*"""
+(?P<line>[0-9a-fA-F]{4,5})\ {4}
+(?P<system_account>[0-9a-fA-F]{6})XX\ {4}[\S\s]*"""
 HB_V1_MATCHER = re.compile(hb_v1_parse_regex, re.X)
 
 # V4 protocol header (checked on raw bytes BEFORE 3DES decryption)
