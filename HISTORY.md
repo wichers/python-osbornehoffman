@@ -1,6 +1,11 @@
 Release History
 ===============
 
+2.2.1 (02-March-2026)
+-------------------
+
+- updated README.md with OHReceiver rename and video classes
+
 2.2.0 (02-March-2026)
 -------------------
 
