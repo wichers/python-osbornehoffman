@@ -158,15 +158,20 @@ class OHConnection:
                     continue
 
                 # Handle DHR — Diffie-Hellman request (V4 setup)
-                # DHR has no system_account; use last known account
+                # V4 DHR has system_account in header; V3 DHR does not
                 if event.get("message_type") == MessageType.DHR:
-                    if self._last_account is None:
+                    if event.get("system_account"):
+                        account = self._resolve_account(event)
+                    else:
+                        account = self._last_account
+                    if account is None:
                         _LOGGER.warning(
-                            "DHR received before any account identified"
+                            "DHR received but no account could be resolved"
                         )
                         continue
+                    self._last_account = account
                     await self._handle_dhr(
-                        event, self._last_account, reader, writer
+                        event, account, reader, writer
                     )
                     continue
 
@@ -304,6 +309,17 @@ class OHConnection:
                 "V4: CRC mismatch (got %04X, expected %04X)", msg_crc, calc_crc
             )
             return True, None
+
+        # Check for plaintext DHR (V4-framed DH request — not encrypted)
+        raw_payload = data[V4_HEADER_IV_LEN : V4_HEADER_IV_LEN + payload_length]
+        if raw_payload == b"DHR":
+            return True, {
+                "peername": peername,
+                "message_type": MessageType.DHR,
+                "system_account": system_account,
+                "panel_iv": panel_iv,
+                "encrypted_ack": False,
+            }
 
         # Get AES key for this account
         aes_key = self._get_aes_key(system_account)
@@ -522,7 +538,8 @@ class OHConnection:
         from .dh import negotiate_dh
 
         _LOGGER.info("DHR: Starting Diffie-Hellman negotiation")
-        aes_key = await negotiate_dh(reader, writer)
+        panel_iv = event.get("panel_iv", b"\x00" * 16)
+        aes_key = await negotiate_dh(reader, writer, self._server_iv, panel_iv)
 
         if aes_key is None:
             _LOGGER.warning("DHR: Key exchange failed")

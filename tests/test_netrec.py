@@ -359,17 +359,24 @@ async def _try_v4_full_dh(base) -> tuple[bool, str]:
         print(f"  Server public key received ({server_key_len} bytes)")
 
         # Step 7: Compute shared secret and derive AES key
+        # Pad to DH modulus size (256 bytes for 2048-bit) to match Java's
+        # KeyAgreement.generateSecret() which returns fixed-length output
         shared_int = pow(server_public, panel_private, p)
-        shared_bytes = shared_int.to_bytes(
-            (shared_int.bit_length() + 7) // 8, "big"
-        )
+        dh_byte_len = (p.bit_length() + 7) // 8
+        shared_bytes = shared_int.to_bytes(dh_byte_len, "big")
         aes_key = shared_bytes[:32]
         print(f"  AES key derived ({aes_key.hex()[:16]}...)")
 
-        # Step 8: Send AES-encrypted ACK to confirm
+        # Step 8: Send AES/CBC encrypted ACK with mixed IV
+        # V3-style DHR has no panel_iv, so panel_iv defaults to zeros
+        # Mixed IV: even bytes from server, odd bytes from panel (zeros here)
+        dhr_panel_iv = b"\x00" * 16
+        mixed_iv_ack = bytearray(16)
+        for i in range(16):
+            mixed_iv_ack[i] = server_iv[i] if i % 2 == 0 else dhr_panel_iv[i]
         ack_data = b"ACK\r" + b"\x00" * 12
-        aes_ecb = AES.new(aes_key, AES.MODE_ECB)
-        writer.write(aes_ecb.encrypt(ack_data))
+        ack_cipher = AES.new(aes_key, AES.MODE_CBC, bytes(mixed_iv_ack))
+        writer.write(ack_cipher.encrypt(ack_data))
         await writer.drain()
         print(f"  DH ACK sent — key exchange complete")
 

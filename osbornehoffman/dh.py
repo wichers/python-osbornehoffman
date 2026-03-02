@@ -107,10 +107,11 @@ class OHDiffieHellman:
             raise ValueError("Invalid peer public key")
 
         # Compute shared secret: peer_public^private mod p
+        # Pad to DH modulus size (256 bytes for 2048-bit) to match Java's
+        # KeyAgreement.generateSecret() which returns fixed-length output
         shared_int = pow(peer_public_key, self._private_key, self._p)
-        self._shared_secret = shared_int.to_bytes(
-            (shared_int.bit_length() + 7) // 8, "big"
-        )
+        dh_byte_len = (self._p.bit_length() + 7) // 8
+        self._shared_secret = shared_int.to_bytes(dh_byte_len, "big")
 
         # Extract first 32 bytes as AES-256 key
         if len(self._shared_secret) < 32:
@@ -127,6 +128,8 @@ class OHDiffieHellman:
 async def negotiate_dh(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    server_iv: bytes,
+    panel_iv: bytes,
 ) -> bytes | None:
     """Perform server-side DH key exchange with a panel.
 
@@ -134,7 +137,7 @@ async def negotiate_dh(
         1. Server sends DH parameters (ASN.1 DER, length-prefixed)
         2. Server reads panel's public key (length-prefixed)
         3. Server sends its public key (length-prefixed)
-        4. Panel sends AES-encrypted ACK to confirm
+        4. Panel sends AES/CBC encrypted ACK (mixed IV) to confirm
 
     Returns the derived 32-byte AES key, or None on failure.
     """
@@ -172,11 +175,16 @@ async def negotiate_dh(
         _LOGGER.warning("DH: Failed to compute shared secret: %s", exc)
         return None
 
-    # Step 4: Read and validate encrypted ACK from panel
+    # Step 4: Read and validate AES/CBC encrypted ACK from panel
+    # Panel encrypts ACK with mixed IV: even bytes from server, odd from panel
     _LOGGER.debug("DH: Waiting for encrypted ACK")
     try:
+        mixed_iv = bytearray(16)
+        for i in range(16):
+            mixed_iv[i] = server_iv[i] if i % 2 == 0 else panel_iv[i]
+
         encrypted_ack = await asyncio.wait_for(reader.readexactly(16), timeout=30)
-        cipher = AES.new(aes_key, AES.MODE_ECB)
+        cipher = AES.new(aes_key, AES.MODE_CBC, bytes(mixed_iv))
         ack = cipher.decrypt(encrypted_ack)
         if not ack[:4] == b"ACK\r":
             _LOGGER.warning("DH: Invalid ACK from panel: %s", ack)

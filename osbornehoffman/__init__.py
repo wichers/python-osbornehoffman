@@ -19,7 +19,8 @@ from .account import (
     InvalidPanelIDLengthError,
     OHAccount,
 )
-from .client import OHClient
+from .receiver import OHReceiver
 from .event import OHEvent
 from .keystore import OHKeyStore
 from .server import MessageType, OHServer
+from .video import OHVideoEvent, OHVideoServer
