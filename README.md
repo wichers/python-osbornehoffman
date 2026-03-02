@@ -30,18 +30,18 @@ Requires Python >= 3.10 and `pycryptodome`.
 
 ## Usage
 
-### Using OHClient (recommended)
+### Using OHReceiver (recommended)
 
 ```python
 import asyncio
-from osbornehoffman import OHClient, OHAccount, OHEvent
+from osbornehoffman import OHReceiver, OHAccount, OHEvent
 
 async def main():
     async def on_event(event: OHEvent) -> None:
         print(f"Event: code={event.code}, account={event.effective_account}")
 
     accounts = [OHAccount("001234")]
-    async with OHClient("0.0.0.0", 8996, accounts, on_event) as client:
+    async with OHReceiver("0.0.0.0", 8996, accounts, on_event) as receiver:
         await asyncio.Event().wait()  # run forever
 
 asyncio.run(main())
@@ -69,9 +69,11 @@ asyncio.run(main())
 
 ## Key Classes
 
-- `OHClient` - High-level async client with lifecycle management (start/stop, context manager)
+- `OHReceiver` - High-level async receiver with lifecycle management (start/stop, context manager)
 - `OHServer` - Low-level TCP server handling protocol framing and encryption
 - `OHAccount` - Account configuration (account_id, panel_id, forward_heartbeat)
 - `OHEvent` - Parsed event dataclass with `code`, `ri`, `effective_account` properties
 - `OHKeyStore` - JSON-based persistence for V4 AES keys
+- `OHVideoServer` - TCP server for receiving video clips from panels
+- `OHVideoEvent` - Parsed video clip event with image data and alarm info
 - `MessageType` - Enum for event types (SIA, CID, HB_V1, HB_V2, DHR, V4)
