@@ -1,6 +1,17 @@
 Release History
 ===============
 
+2.2.0 (02-March-2026)
+-------------------
+
+- fixed V4 CBC cipher lifecycle: use continuous cipher for entire video session instead of re-initializing after clip header
+- fixed DH shared secret padding to DH modulus size (256 bytes for 2048-bit) matching Java KeyAgreement.generateSecret()
+- fixed DH ACK encryption to use AES/CBC with mixed IV instead of AES/ECB
+- fixed V4-framed DHR detection: plaintext DHR in V4 frame must be detected before AES decryption
+- renamed OHClient to OHReceiver (matches alarm industry terminology and Java OHNetRec naming)
+- added OHVideoServer and OHVideoEvent for receiving video clips from panels
+- added video test client (tests/test_video_client.py) for V3/V4 video protocol testing
+
 2.1.1 (01-March-2026)
 -------------------
 
